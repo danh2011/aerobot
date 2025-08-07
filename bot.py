@@ -1,6 +1,5 @@
 import os
 import json
-import asyncio
 import logging
 from datetime import datetime
 import discord
@@ -15,19 +14,36 @@ load_dotenv()
 TOKEN           = os.getenv("DISCORD_TOKEN")
 NEWS_CHANNEL_ID = int(os.getenv("NEWS_CHANNEL_ID", 0))
 FEED_URL        = os.getenv("FEED_URL", "https://simpleflying.com/feed")
-REACTION_FILE   = "reaction_roles.json"
 
-logger = logging.getLogger('aerobot')
-logger.setLevel(logging.INFO)
-handler = logging.StreamHandler()
-handler.setFormatter(logging.Formatter(
-    '[%(asctime)s] %(levelname)s:%(name)s: %(message)s',
+BASE_DIR        = os.path.dirname(__file__)
+REACTION_FILE   = os.path.join(BASE_DIR, "reaction_roles.json")
+NEWS_STATE_FILE = os.path.join(BASE_DIR, "news_state.json")
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='[%(asctime)s] %(levelname)s:%(name)s: %(message)s',
     datefmt='%Y-%m-%d %H:%M:%S'
-))
-logger.addHandler(handler)
+)
+logger = logging.getLogger("aerobot")
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Intents & Bot setup
+# Helpers to persist JSON data
+def load_json(path):
+    if not os.path.isfile(path):
+        with open(path, 'w') as fp:
+            json.dump({}, fp)
+    with open(path, 'r') as fp:
+        return json.load(fp)
+
+def save_json(path, data):
+    with open(path, 'w') as fp:
+        json.dump(data, fp, indent=2)
+
+reaction_roles = load_json(REACTION_FILE)
+news_state    = load_json(NEWS_STATE_FILE)
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Bot setup
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
@@ -35,30 +51,21 @@ intents.reactions = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 tree = bot.tree
+_synced = False
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Utilities for reaction-role persistence
-def load_reaction_roles():
-    if os.path.isfile(REACTION_FILE):
-        with open(REACTION_FILE, 'r') as f:
-            return json.load(f)
-    return {}
+# Event handlers
 
-def save_reaction_roles(data):
-    with open(REACTION_FILE, 'w') as f:
-        json.dump(data, f, indent=2)
-
-reaction_roles = load_reaction_roles()
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Events
 @bot.event
 async def on_ready():
+    global _synced
     logger.info(f"Logged in as {bot.user} (ID: {bot.user.id})")
-    await tree.sync()
-    logger.info("Slash commands synced.")
-    if NEWS_CHANNEL_ID:
-        fetch_news.start()
+    if not _synced:
+        await tree.sync()
+        logger.info("Slash commands synced.")
+        _synced = True
+        if NEWS_CHANNEL_ID:
+            fetch_news.start()
 
 @bot.event
 async def on_raw_reaction_add(payload):
@@ -70,7 +77,7 @@ async def on_raw_reaction_add(payload):
         member = guild.get_member(payload.user_id)
         role = guild.get_role(role_id)
         await member.add_roles(role)
-        logger.info(f"Added role {role.name} to {member.display_name} via reaction {payload.emoji}")
+        logger.info(f"Added role {role.name} to {member.display_name} via {payload.emoji}")
 
 @bot.event
 async def on_raw_reaction_remove(payload):
@@ -82,92 +89,91 @@ async def on_raw_reaction_remove(payload):
         member = guild.get_member(payload.user_id)
         role = guild.get_role(role_id)
         await member.remove_roles(role)
-        logger.info(f"Removed role {role.name} from {member.display_name} via reaction {payload.emoji}")
+        logger.info(f"Removed role {role.name} from {member.display_name} via {payload.emoji}")
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Slash Commands
+# Slash commands
 
-## Moderation
-@tree.command(name="kick", description="Kick a member")
+# Moderation: kick
+@tree.command(name="kick", description="Kick a member from the server")
 @app_commands.checks.has_permissions(kick_members=True)
-async def slash_kick(interaction: discord.Interaction, member: discord.Member, reason: str="No reason provided"):
+async def slash_kick(interaction: discord.Interaction, member: discord.Member, reason: str = "No reason provided"):
     await member.kick(reason=reason)
-    await interaction.response.send_message(f"👢 {member} kicked: {reason}", ephemeral=True)
+    await interaction.response.send_message(f"👢 {member.mention} has been kicked. Reason: {reason}", ephemeral=True)
     logger.info(f"{interaction.user} kicked {member} ({reason})")
 
-@tree.command(name="ban", description="Ban a member")
+# Moderation: ban
+@tree.command(name="ban", description="Ban a member from the server")
 @app_commands.checks.has_permissions(ban_members=True)
-async def slash_ban(interaction: discord.Interaction, member: discord.Member, reason: str="No reason provided"):
+async def slash_ban(interaction: discord.Interaction, member: discord.Member, reason: str = "No reason provided"):
     await member.ban(reason=reason)
-    await interaction.response.send_message(f"🔨 {member} banned: {reason}", ephemeral=True)
+    await interaction.response.send_message(f"🔨 {member.mention} has been banned. Reason: {reason}", ephemeral=True)
     logger.info(f"{interaction.user} banned {member} ({reason})")
 
-@tree.command(name="mute", description="Mute a member (add 'Muted' role)")
+# Moderation: mute
+@tree.command(name="mute", description="Mute a member by adding a Muted role")
 @app_commands.checks.has_permissions(manage_roles=True)
 async def slash_mute(interaction: discord.Interaction, member: discord.Member):
     role = discord.utils.get(interaction.guild.roles, name="Muted")
     if not role:
         role = await interaction.guild.create_role(name="Muted")
-        for ch in interaction.guild.channels:
-            await ch.set_permissions(role, speak=False, send_messages=False)
+        for c in interaction.guild.channels:
+            await c.set_permissions(role, speak=False, send_messages=False)
     await member.add_roles(role)
-    await interaction.response.send_message(f"🤐 {member} has been muted.", ephemeral=True)
+    await interaction.response.send_message(f"🤐 {member.mention} has been muted.", ephemeral=True)
     logger.info(f"{interaction.user} muted {member}")
 
-## Reaction Roles Setup
-@tree.command(name="add_reaction_role", description="Set up a reaction role")
+# Reaction role setup
+@tree.command(name="add_reaction_role", description="Configure a reaction role on a message")
 @app_commands.checks.has_permissions(manage_roles=True)
 async def add_reaction_role(
     interaction: discord.Interaction,
-    message_id: str,
+    message_id: int,
     emoji: str,
     role: discord.Role
 ):
     key = f"{interaction.channel_id}-{message_id}"
-    mapping = reaction_roles.get(key, {})
-    mapping[emoji] = role.id
-    reaction_roles[key] = mapping
-    save_reaction_roles(reaction_roles)
+    reaction_roles.setdefault(key, {})[emoji] = role.id
+    save_json(REACTION_FILE, reaction_roles)
     await interaction.response.send_message(
-        f"✅ Reaction role set: React with {emoji} on message {message_id} to get {role.mention}",
+        f"✅ React with {emoji} on message {message_id} to get {role.mention}",
         ephemeral=True
     )
-    logger.info(f"Reaction role configured on {message_id} {emoji}→{role.name}")
+    logger.info(f"Set reaction role in {interaction.channel.name} msg {message_id}: {emoji} → {role.name}")
 
-## Aviation News Management
+# ──────────────────────────────────────────────────────────────────────────────
+# Aviation news fetcher
+
 @tasks.loop(minutes=60)
 async def fetch_news():
-    logger.info("Fetching aviation news feed...")
-    feed = feedparser.parse(FEED_URL)
-    channel = bot.get_channel(NEWS_CHANNEL_ID)
-    now = datetime.utcnow()
-    for entry in feed.entries[:5]:
-        # Use published_parsed or fallback
-        pub = datetime(*entry.published_parsed[:6]) if 'published_parsed' in entry else now
-        key = f"news:{entry.id}"
-        if not bot.cache.get(key):
-            await channel.send(f"📰 **{entry.title}**\n{entry.link}")
-            bot.cache[key] = pub.isoformat()
-            logger.info(f"Posted news: {entry.title}")
-
-@fetch_news.before_loop
-async def before_fetch_news():
-    await bot.wait_until_ready()
+    try:
+        feed = feedparser.parse(FEED_URL)
+        channel = bot.get_channel(NEWS_CHANNEL_ID)
+        if channel is None:
+            logger.error(f"Invalid NEWS_CHANNEL_ID: {NEWS_CHANNEL_ID}")
+            return
+        for entry in feed.entries[:5]:
+            if entry.id not in news_state:
+                await channel.send(f"📰 **{entry.title}**\n{entry.link}")
+                news_state[entry.id] = True
+        save_json(NEWS_STATE_FILE, news_state)
+        logger.info("Aviation news fetched and posted.")
+    except Exception:
+        logger.exception("Error in fetch_news loop")
 
 # ──────────────────────────────────────────────────────────────────────────────
-# In-memory cache (won't persist across restarts—but avoids repost spam)
-bot.cache = {}
+# Error handler for slash commands
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Error handling
 @bot.event
 async def on_app_command_error(interaction: discord.Interaction, error):
     if isinstance(error, app_commands.errors.MissingPermissions):
         await interaction.response.send_message("❌ You lack the required permissions.", ephemeral=True)
     else:
-        await interaction.response.send_message("⚠️ An error occurred.", ephemeral=True)
-        logger.exception(f"Error in command {interaction.command}:")
+        await interaction.response.send_message("⚠️ An error occurred while processing the command.", ephemeral=True)
+        logger.exception(f"Error in command {interaction.command.name}")
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Start the bot
+
 if __name__ == "__main__":
     bot.run(TOKEN)
